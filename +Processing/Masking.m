@@ -1,4 +1,4 @@
-function [eyeMask,eyeEllipse,problemsMask,exampleImage] = Masking(movies, block, exampleFrame)
+function [eyeMask,eyeEllipse,problemsMask] = Masking(movies, block, exampleFrame)
 
     exampleMovie = VideoReader(movies(block).name);
     exampleImage = read(exampleMovie,exampleFrame);
