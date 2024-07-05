@@ -9,7 +9,6 @@ locations{2} = outputFolder;
 save("W:\James\PupilProcessing2\Temp\locations", 'locations');
 cd(inputFolder);
 movies=dir('*.avi');
-sampling_rate = VideoReader(movies(1).name).FrameRate;
 numBlocks = size(movies,1);
 save("pupil_setup.mat")
 
@@ -24,51 +23,106 @@ sampling_rate = VideoReader(movies(1).name).FrameRate;
 load("pupil_setup.mat");
 numBlocks = size(movies,1);
 
-%% Establish processing parameters
+%% select ROI
 block = 5;
 exampleFrame = 225;
 
 theMovie = VideoReader(movies(block).name);
-[eyeMask,eyeEllipse,problemsMask] = Processing.Masking(movies,block,exampleFrame);
+[eyeMask] = Processing.Masking(movies,block,exampleFrame);
 save('pupil_setup');
 
-%% get stats for all movies at once using parallel computing
+%% PCA on full dataset
+framesIndices = [151 175 145 1331;
+                3152 3175 3144 4331];
+chunkSize = 500;
 
-addpath(genpath("W:\James\PupilProcessing2"));
-cd(inputFolder)
-
-chunkSize = 250; % how many frames to load and send to GPU at once?
-
-parfor blck = 1:numBlocks
-    GetBlockStatsFunc(movies,blck,eyeMask,outputFolder,chunkSize)
-    pause(1.5) % pause so that loading movies is offset; use full bandwidth from the beginning
+parfor blck = 1:2%numBlocks
+    CutAndReshapeFunc(movies,blck,framesIndices,chunkSize,eyeMask,outputFolder)
 end
 
-%% concatenate structures
-for blck = 1:numBlocks
-    outputName = strcat(outputFolder,'\block',num2str(blck),'Stats');
+%% concatenate cut and reshaped blocks
+
+for blck = 1:2%numBlocks
+    outputName = strcat(outputFolder,'\block',num2str(blck),'2D');
     load(outputName)
 
     if blck ~= 1
-            datasetStatsStruct.MeanInt = [datasetStatsStruct.MeanInt blockStatsStruct.MeanInt];
-            datasetStatsStruct.MaxInt = [datasetStatsStruct.MaxInt blockStatsStruct.MaxInt];
-            datasetStatsStruct.MinInt = [datasetStatsStruct.MinInt blockStatsStruct.MinInt];
-            datasetStatsStruct.STDev = [datasetStatsStruct.STDev blockStatsStruct.STDev];
-        else 
-            datasetStatsStruct = blockStatsStruct;
+        thisDataset2D = [thisDataset2D thisBlock2D];
+    else
+        thisDataset2D = thisBlock2D;
     end
-
 end
-save('datasetStatsStruct', "datasetStatsStruct")
-%% functions 
 
+%% normalize dataset and do PCA
+
+[U,S,V] = svd(thisDataset2D,'econ','vector');
+thisDatasetMeanFrame = mean(thisDataset2D,2);
+thisDatasetNormalized = thisDataset2D - thisDatasetMeanFrame;
+for pc = 1:3
+    for frm = 1:size(thisDatasetNormalized,2)
+        thisDatasetNormInPC(pc, frm) = thisDatasetNormalized(:,frm)'*U(:,pc);
+    end
+end
+
+%% plotting 
+
+% 1:size(thisDatasetNormInPC,2)
+scatter3(thisDatasetNormInPC(1,:) , thisDatasetNormInPC(2,:) ,thisDatasetNormInPC(3,:) ,"Marker",".","MarkerEdgeColor","k")
+xticks([])
+yticks([])
+zticks([])
+xlabel("1")
+ylabel("2")
+zlabel("3")
+
+%% functions
+
+function CutAndReshapeFunc(movies,block,framesIndices,chunkSize,eyeMask,outputFolder)
+    disp(strcat("starting block ", num2str(block)));
+    tic
+    theMovie = VideoReader(movies(block).name);
+    thisBlockStartFrame = framesIndices(1,block);
+    thisBlockEndFrame = framesIndices(2,block);
+    thisBlockNumFrames = thisBlockEndFrame-thisBlockStartFrame;
+
+    for chnk = 1:round(thisBlockNumFrames/chunkSize,TieBreaker="plusinf")
+        chunkStartFrame = thisBlockStartFrame + ((chnk-1)*chunkSize);
+
+        if thisBlockStartFrame + (chnk*chunkSize) > thisBlockEndFrame
+            chunkEndFrame = thisBlockEndFrame;
+        else
+            chunkEndFrame = thisBlockStartFrame + (chnk * chunkSize);
+        end
+    
+        thisChunk = read(theMovie, [chunkStartFrame chunkEndFrame]);
+        thisChunk = im2single(thisChunk);
+        thisChunk = thisChunk(eyeMask(2):eyeMask(2)+eyeMask(4), eyeMask(1):eyeMask(1)+eyeMask(3),1,:);
+        [yPixels, xPixels, nFrames] = size(thisChunk);
+        thisChunk2D = reshape(thisChunk,xPixels*yPixels,nFrames);
+
+        if chnk ~= 1 % add chunk struct to block struct
+            thisBlock2D = [thisBlock2D thisChunk2D];
+        else 
+            thisBlock2D = thisChunk2D;
+        end
+        thisChunk2D = []; % clear the chunk so it isn't taking up memory before being overwritten
+    end
+    
+    outputName = strcat(outputFolder,'\block',num2str(block),'2D'); % save the block struct
+    save(outputName,"thisBlock2D")
+    thisBlock2D = [];
+    toc
+    disp(strcat("Block ",num2str(block), " complete."))
+end % end CutAndReshapeFunc
+
+% this is now defunct but it's well written so it's worth keeping to look back at
 function GetBlockStatsFunc(movies, block, eyeMask,outputFolder,chunkSize)
     blockStatsStruct = struct;
     chunkStatsStruct = struct;
     theMovie = VideoReader(movies(block).name);
     numFrames = theMovie.NumFrames;
     tic
-    disp(strcat('starting block', ' ' ,num2str(block)))
+    disp(strcat("starting block ",num2str(block)))
     
     for chnk = 1:round(numFrames/chunkSize,TieBreaker="plusinf") % cannot send whole block to GPU at once so must break it up;
         chunkStartFrame = 1 + ((chnk-1)*chunkSize);              
@@ -80,33 +134,24 @@ function GetBlockStatsFunc(movies, block, eyeMask,outputFolder,chunkSize)
     
         thisChunk = read(theMovie, [chunkStartFrame, chunkEndFrame]); % read select frames of AVI into matrix on CPU
         thisChunk = gpuArray(thisChunk);                              % pass the matrix to GPU
+        thisChunk = im2single(thisChunk);
         thisChunk = thisChunk(eyeMask(2):eyeMask(2)+eyeMask(4), eyeMask(1):eyeMask(1)+eyeMask(3),1,:); % crop the matrix as a block 
         
         for frm = 1:chunkEndFrame-chunkStartFrame+1 % collect stats on each frame
-            chunkStatsStruct.MeanInt(frm) = mean(thisChunk(:,:,1,frm),"all"); 
-    
-            chunkStatsStruct.MaxInt(frm) = max(thisChunk(:,:,1,frm),[],"all");
-    
-            chunkStatsStruct.MinInt(frm) = min(thisChunk(:,:,1,frm),[],"all");
-            
-            thisFrame = im2single(thisChunk(:,:,1,frm));
-            chunkStatsStruct.STDev(frm) = std(thisFrame,1,"all")*256;
+            ;
         end
     
         if chnk ~= 1 % add chunk struct to block struct
-            blockStatsStruct.MeanInt = [blockStatsStruct.MeanInt chunkStatsStruct.MeanInt];
-            blockStatsStruct.MaxInt = [blockStatsStruct.MaxInt chunkStatsStruct.MaxInt];
-            blockStatsStruct.MinInt = [blockStatsStruct.MinInt chunkStatsStruct.MinInt];
-            blockStatsStruct.STDev = [blockStatsStruct.STDev chunkStatsStruct.STDev];
+            ;
         else 
             blockStatsStruct = chunkStatsStruct;
         end
-        chunkStatsStruct = [];
+        chunkStatsStruct = []; % clear the chunk struct so it isn't taking up memory before being overwritten
     end
     
     outputName = strcat(outputFolder,'\block',num2str(block),'Stats'); % save the block struct
     save(outputName,"blockStatsStruct")
     blockStatsStruct = [];
-    disp(strcat('Block ',num2str(block), 'complete.'))
+    disp(strcat("Block ",num2str(block), " complete."))
     toc
 end % end GetBlockStatsFunc
